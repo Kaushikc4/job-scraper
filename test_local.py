@@ -33,11 +33,11 @@ class FakeTable:
 lf.get_ddb_table = lambda: FakeTable()
 
 # --- Stub SES: print the digest instead of sending ---------------------
-def fake_send_digest_email(new_jobs):
-    if not new_jobs:
-        print("\n[SES STUB] No new jobs — would skip sending.\n")
+def fake_send_digest_email(new_jobs, company_results):
+    if not new_jobs and not lf.has_scrape_issues(company_results):
+        print("\n[SES STUB] No new jobs and no scrape issues — would skip sending.\n")
         return
-    text_body, _html_body = lf.build_email_body(new_jobs)
+    text_body, _html_body = lf.build_email_body(new_jobs, company_results)
     print("\n" + "=" * 70)
     print(f"[SES STUB] Would send digest email to {lf.RECIPIENT_EMAIL or '(RECIPIENT_EMAIL not set)'}")
     print(f"[SES STUB] From: {lf.SENDER_EMAIL or '(SENDER_EMAIL not set)'}")
