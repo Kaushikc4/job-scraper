@@ -1,0 +1,88 @@
+{
+  "Comment": "SDE1 Job Scraper: load config, scrape companies in parallel, send digest",
+  "StartAt": "LoadConfig",
+  "States": {
+    "LoadConfig": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:sde1-config-loader",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "ScrapeAllCompanies"
+    },
+    "ScrapeAllCompanies": {
+      "Type": "Map",
+      "ItemsPath": "$.companies",
+      "MaxConcurrency": 10,
+      "ItemSelector": {
+        "name.$": "$$.Map.Item.Value.name",
+        "url.$": "$$.Map.Item.Value.url",
+        "include_keywords.$": "$.include_keywords",
+        "exclude_keywords.$": "$.exclude_keywords"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "ScrapeCompany",
+        "States": {
+          "ScrapeCompany": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:sde1-worker",
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "ResultPath": "$.errorInfo",
+                "Next": "HandleCompanyError"
+              }
+            ],
+            "End": true
+          },
+          "HandleCompanyError": {
+            "Type": "Pass",
+            "Comment": "One company's Lambda invocation failed outright (not the graceful timeout/error results worker_handler already returns for known failure modes) - produce the same result shape so the Map's output stays uniform for the aggregator.",
+            "Parameters": {
+              "company.$": "$.name",
+              "status": "error",
+              "detail.$": "$.errorInfo.Cause",
+              "scraped": 0,
+              "jobs": []
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "SendDigest"
+    },
+    "SendDigest": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:sde1-aggregator",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

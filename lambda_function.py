@@ -1,64 +1,23 @@
 """
-SDE1 Job Scraper — AWS Lambda function.
+SDE1 Job Scraper.
 
 Scrapes career pages of MNCs configured in a published Google Sheet CSV,
 filters titles for SDE1-relevant roles using include/exclude keywords
-(also from the sheet), deduplicates against a DynamoDB table, and emails
-a digest of newly found jobs via SES.
+(also from the sheet) plus an India/Remote location filter, deduplicates
+against a DynamoDB table, and emails a digest of newly found jobs via SES.
 
-=====================================================================
-ONE-TIME MANUAL SETUP (read this before deploying)
-=====================================================================
+Orchestrated by AWS Step Functions as three separate Lambda functions —
+all built from this same container image, differentiated only by which
+handler in this file each one's --image-config Command points at:
 
-1. Google Sheet config
-   - Create a Google Sheet with three columns: type, value1, value2
-     (see README.md for the exact row format).
-   - File -> Share -> Publish to web -> select the sheet/tab -> CSV.
-   - Copy the published link and replace CONFIG_CSV_URL below (or, better,
-     set it via the CONFIG_CSV_URL environment variable so you don't have
-     to edit code).
+    config_loader_handler  -> Lambda "sde1-config-loader"
+    worker_handler          -> Lambda "sde1-worker" (one invocation per
+                                company, run in parallel by a Map state)
+    aggregator_handler      -> Lambda "sde1-aggregator"
 
-2. SES sandbox verification (REQUIRED or email sending will fail)
-   - By default, new SES accounts are in "sandbox mode": you can only
-     send email to/from addresses you have individually verified.
-   - In the AWS Console: SES -> Verified identities -> Create identity
-     -> Email address. Do this for BOTH the sender address (SENDER_EMAIL)
-     and the recipient address (RECIPIENT_EMAIL). Each will receive a
-     confirmation email with a link you must click.
-   - Until both are verified, SendEmail calls will fail with
-     "Email address is not verified".
-   - To send to arbitrary recipients without per-address verification,
-     you'd need to request production access (moves SES out of sandbox).
-
-3. DynamoDB table
-   - Table name: job_scraper_seen_jobs (or set SEEN_JOBS_TABLE env var).
-   - Partition key: job_id (String).
-   - Enable TTL on attribute "ttl" (Number, epoch seconds) so old rows
-     auto-expire (this script writes ttl = now + SEEN_JOB_TTL_DAYS days).
-   - See the seed schema note near write_seen_job() below.
-
-4. Lambda environment variables
-   - CONFIG_CSV_URL      published Google Sheet CSV URL
-   - SENDER_EMAIL        SES-verified "from" address
-   - RECIPIENT_EMAIL     SES-verified "to" address (comma-separated for multiple)
-   - SEEN_JOBS_TABLE      (optional, default "job_scraper_seen_jobs")
-   - SEEN_JOB_TTL_DAYS    (optional, default "75")
-   - AWS_REGION is provided automatically by Lambda; SES/DynamoDB clients
-     use it unless SES_REGION / DDB_REGION are set explicitly.
-
-5. IAM permissions required by the Lambda execution role
-   - ses:SendEmail, ses:SendRawEmail
-   - dynamodb:GetItem, dynamodb:PutItem on the seen-jobs table
-   - logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents
-     (standard CloudWatch Logs access, usually via the
-     AWSLambdaBasicExecutionRole managed policy)
-
-6. EventBridge schedule (twice daily)
-   - Rate expression:  rate(12 hours)
-   - or Cron expression (e.g. 9am and 9pm UTC): cron(0 9,21 * * ? *)
-   - Target: this Lambda function. No special input payload required.
-
-=====================================================================
+See state_machine.asl.json for the state machine definition and
+README.md for the full setup/deploy walkthrough (Google Sheet, SES
+verification, DynamoDB table, IAM roles, EventBridge schedule).
 """
 
 import csv
@@ -118,10 +77,6 @@ USER_AGENT = (
 # culprit) can silently consume the entire Lambda invocation and lose
 # every result — including from companies that already scraped fine.
 PER_COMPANY_TIMEOUT_SECONDS = int(os.environ.get("PER_COMPANY_TIMEOUT_SECONDS", "90"))
-# Stop starting new companies once less than this much invocation time
-# remains, so there's always enough runway left to dedupe/filter/email
-# whatever was already scraped rather than timing out with nothing sent.
-REMAINING_TIME_BUFFER_MS = int(os.environ.get("REMAINING_TIME_BUFFER_MS", "60000"))
 
 # ---------------------------------------------------------------------------
 # AWS clients (created lazily so unit tests can import this module without
@@ -753,18 +708,17 @@ def scrape_generic_html(company_name, url):
 
 class PlaywrightRenderer:
     """
-    Lazily launches a single headless Chromium instance on first use and
-    reuses it across every company in this Lambda invocation that needs
-    JS rendering — browser startup is the expensive part, so we pay it
-    at most once per run. Call close() when done (lambda_handler does
-    this in a finally block).
+    Lazily launches a headless Chromium instance on first use. One
+    instance is created per worker_handler invocation (one company each
+    — see Step Functions handlers below) and closed at the end of that
+    same invocation; there's no cross-company reuse to manage since each
+    company already gets its own Lambda invocation.
 
-    If the browser process crashes mid-run (observed in practice after
-    rendering a heavy page like Google's search results — a single
-    "--single-process" Chromium instance can die from resource pressure
-    and take the whole tab-context with it), render() detects the dead
-    browser and relaunches once rather than silently failing every
-    remaining company for the rest of the invocation.
+    If the browser process crashes mid-scrape (observed in practice on
+    heavy pages — a single "--single-process" Chromium instance can die
+    from resource pressure and take the whole tab-context with it),
+    render()/open_page() detect the dead browser and relaunch once
+    rather than failing outright.
 
     Requires the `playwright` package AND its Chromium browser binary to
     be present in the runtime — see README.md for the container-image
@@ -1287,8 +1241,27 @@ def send_digest_email(new_jobs, company_results):
 
 
 # ---------------------------------------------------------------------------
-# 6. Lambda handler
+# 6. Step Functions handlers
 # ---------------------------------------------------------------------------
+#
+# Three Lambda functions, all pointing at this same module, orchestrated
+# by a Step Functions state machine (state_machine.asl.json):
+#
+#   LoadConfig (config_loader_handler)
+#         │  output: {"companies": [...], "include_keywords": [...],
+#         │           "exclude_keywords": [...]}
+#         ▼
+#   ScrapeAllCompanies — Map state, one worker_handler invocation per
+#   company, run in parallel (MaxConcurrency 10)
+#         │  output: [worker_handler result, ...] — one per company
+#         ▼
+#   SendDigest (aggregator_handler)
+#
+# Splitting scraping into one Lambda invocation per company is what
+# keeps each invocation short regardless of how many companies are
+# configured — the old single-Lambda version looped over every company
+# sequentially in one invocation, so total runtime (and risk of hitting
+# Lambda's 15-minute hard ceiling) grew with the company count.
 
 class ScrapeTimeoutError(BaseException):
     """
@@ -1323,110 +1296,132 @@ def _run_with_timeout(func, timeout_seconds, *args, **kwargs):
         signal.signal(signal.SIGALRM, old_handler)
 
 
-def lambda_handler(event, context):
-    logger.info("SDE1 job scraper run starting.")
+def config_loader_handler(event, context):
+    """
+    Step Functions first state (LoadConfig). Fetches and parses the
+    Google Sheet CSV — thin wrapper around the existing load_config().
+    Its return value becomes the Map state's input, so ItemsPath
+    ("$.companies") and the per-item keyword params in the state
+    machine definition both read directly off this shape.
+    """
+    return load_config(CONFIG_CSV_URL)
 
-    config = load_config(CONFIG_CSV_URL)
-    companies = config["companies"]
-    include_keywords = config["include_keywords"]
-    exclude_keywords = config["exclude_keywords"]
 
-    if not companies or not include_keywords:
-        logger.error("Config incomplete (companies=%d, include_keywords=%d) — aborting run.",
-                      len(companies), len(include_keywords))
-        return {"statusCode": 200, "body": json.dumps({"new_jobs": 0, "reason": "incomplete_config"})}
+def worker_handler(event, context):
+    """
+    Step Functions Map-state worker (ScrapeAllCompanies). Scrapes and
+    filters exactly one company per invocation.
 
-    all_jobs = []
-    company_results = []  # [{"name", "scraped", "status": "ok"/"timeout"/"error"/"skipped", "detail"}]
+    event: {"name": str, "url": str, "include_keywords": [str],
+             "exclude_keywords": [str]}
+
+    Returns a uniformly-shaped result — this is also what
+    aggregator_handler uses to reconstruct the email's per-company
+    "Scrape status" section, so the shape mirrors the old lambda_handler
+    loop's company_results entries:
+        {"company": str, "status": "ok"|"timeout"|"error",
+         "detail": str|None, "scraped": int, "jobs": [...]}
+
+    "scraped" is the raw pre-filter count, deliberately distinct from
+    len(jobs) (the post-filter/relevant count) — this is what lets the
+    digest email distinguish "this site is bot-blocked and returned
+    nothing but nav-link noise" (scraped > 0, jobs == []) from "this
+    site genuinely has zero matching openings right now".
+
+    A fresh PlaywrightRenderer is created and torn down within this one
+    invocation — no cross-company reuse to manage, since each company
+    already gets its own invocation. A stuck company can no longer
+    affect any other company's scrape or consume shared run time.
+    """
+    name = event["name"]
+    url = event["url"]
+    include_keywords = event.get("include_keywords", [])
+    exclude_keywords = event.get("exclude_keywords", [])
+
     renderer = PlaywrightRenderer()
     try:
-        for company in companies:
-            if context is not None and hasattr(context, "get_remaining_time_in_millis"):
-                remaining_ms = context.get_remaining_time_in_millis()
-                needed_ms = PER_COMPANY_TIMEOUT_SECONDS * 1000 + REMAINING_TIME_BUFFER_MS
-                if remaining_ms < needed_ms:
-                    logger.warning(
-                        "Only %dms left in this invocation — stopping scrape early "
-                        "before company '%s' to leave time to send whatever was "
-                        "already found.", remaining_ms, company["name"],
-                    )
-                    break
-
-            try:
-                company_jobs, tier = _run_with_timeout(
-                    scrape_company, PER_COMPANY_TIMEOUT_SECONDS, company, renderer
-                )
-                logger.info("Scraped %d job(s) from '%s' (tier=%s)", len(company_jobs), company["name"], tier)
-                all_jobs.extend(company_jobs)
-                detail = (
-                    "generic fallback (best-effort selectors, no known data "
-                    "source for this site) — may include non-job links (nav, "
-                    "language switchers) rather than real postings, especially "
-                    "on bot-protected sites"
-                ) if tier == "generic" else None
-                company_results.append({
-                    "name": company["name"], "scraped": len(company_jobs),
-                    "status": "ok", "detail": detail,
-                })
-            except ScrapeTimeoutError:
-                logger.error(
-                    "Company '%s' exceeded the %ds per-company timeout — skipping "
-                    "it for this run.", company["name"], PER_COMPANY_TIMEOUT_SECONDS,
-                )
-                company_results.append({
-                    "name": company["name"], "scraped": 0, "status": "timeout",
-                    "detail": f"exceeded {PER_COMPANY_TIMEOUT_SECONDS}s per-company timeout",
-                })
-                # The interrupted call may have left the browser/renderer in
-                # a corrupted state (we forcibly interrupted a blocking
-                # Chromium IPC call, not a clean cancellation) — best-effort
-                # close it and start fresh for whatever companies remain
-                # rather than risk every subsequent company inheriting a
-                # broken renderer.
-                try:
-                    _run_with_timeout(renderer.close, 10)
-                except BaseException:  # noqa: BLE001 - deliberately swallow everything, this renderer is being discarded regardless
-                    pass
-                renderer = PlaywrightRenderer()
-                continue
-            except Exception as exc:  # noqa: BLE001 - belt-and-suspenders; scrape_company already isolates
-                logger.error("Unexpected error scraping '%s': %s", company["name"], exc, exc_info=True)
-                company_results.append({
-                    "name": company["name"], "scraped": 0, "status": "error",
-                    "detail": str(exc)[:200],
-                })
-                continue
+        company_jobs, tier = _run_with_timeout(
+            scrape_company, PER_COMPANY_TIMEOUT_SECONDS, {"name": name, "url": url}, renderer
+        )
+        company_jobs = _dedupe_by_job_id(company_jobs)
+        relevant_jobs = filter_jobs(company_jobs, include_keywords, exclude_keywords)
+        detail = (
+            "generic fallback (best-effort selectors, no known data "
+            "source for this site) — may include non-job links (nav, "
+            "language switchers) rather than real postings, especially "
+            "on bot-protected sites"
+        ) if tier == "generic" else None
+        logger.info(
+            "Scraped %d job(s) from '%s' (tier=%s), %d relevant",
+            len(company_jobs), name, tier, len(relevant_jobs),
+        )
+        return {
+            "company": name, "status": "ok", "detail": detail,
+            "scraped": len(company_jobs), "jobs": relevant_jobs,
+        }
+    except ScrapeTimeoutError:
+        logger.error(
+            "Company '%s' exceeded the %ds per-company timeout.", name, PER_COMPANY_TIMEOUT_SECONDS,
+        )
+        return {
+            "company": name, "status": "timeout",
+            "detail": f"exceeded {PER_COMPANY_TIMEOUT_SECONDS}s per-company timeout",
+            "scraped": 0, "jobs": [],
+        }
+    except Exception as exc:  # noqa: BLE001 - never let one company's failure crash this invocation
+        logger.error("Worker failed scraping '%s': %s", name, exc, exc_info=True)
+        return {
+            "company": name, "status": "error", "detail": str(exc)[:200],
+            "scraped": 0, "jobs": [],
+        }
     finally:
         try:
             _run_with_timeout(renderer.close, 30)
-        except ScrapeTimeoutError:
-            logger.warning("Playwright renderer close() timed out — continuing anyway.")
-        except Exception as exc:  # noqa: BLE001 - cleanup must never crash the run
-            logger.warning("Error closing Playwright renderer: %s", exc)
+        except BaseException:  # noqa: BLE001 - best-effort cleanup, must never fail the invocation
+            pass
 
-    # Companies never attempted because the remaining-time budget check
-    # broke out of the loop early — still worth surfacing in the email.
-    attempted_names = {r["name"] for r in company_results}
-    for company in companies:
-        if company["name"] not in attempted_names:
-            company_results.append({
-                "name": company["name"], "scraped": 0, "status": "skipped",
-                "detail": "not enough time remaining in this run",
-            })
 
-    all_jobs = _dedupe_by_job_id(all_jobs)
-    relevant_jobs = filter_jobs(all_jobs, include_keywords, exclude_keywords)
-    logger.info("%d of %d scraped jobs matched keyword filters", len(relevant_jobs), len(all_jobs))
+def aggregator_handler(event, context):
+    """
+    Step Functions final state (SendDigest). `event` is the Map state's
+    collected output — a list of worker_handler results, one per
+    company. This includes both application-level failures
+    worker_handler already handled gracefully (status "timeout"/"error")
+    and, if the state machine's Map-level Catch fired (a company whose
+    Lambda invocation itself failed outright — e.g. an unhandled crash),
+    a same-shaped fallback entry produced by the state machine itself.
+
+    Flattens the already-filtered per-company job lists, dedupes against
+    DynamoDB, sends the digest email, and records newly notified jobs —
+    identical logic to the old lambda_handler's tail end, just now
+    consuming pre-scraped results instead of scraping itself.
+    """
+    worker_results = event if isinstance(event, list) else event.get("results", [])
+
+    all_relevant_jobs = []
+    company_results = []
+    for r in worker_results:
+        company_results.append({
+            "name": r.get("company", "unknown"),
+            "scraped": r.get("scraped", 0),
+            "status": r.get("status", "error"),
+            "detail": r.get("detail"),
+        })
+        all_relevant_jobs.extend(r.get("jobs", []))
 
     table = get_ddb_table()
-    new_jobs = dedupe_against_dynamodb(table, relevant_jobs)
-    logger.info("%d of %d relevant jobs are new (not previously notified)", len(new_jobs), len(relevant_jobs))
+    new_jobs = dedupe_against_dynamodb(table, all_relevant_jobs)
+    logger.info("%d of %d relevant jobs are new (not previously notified)", len(new_jobs), len(all_relevant_jobs))
 
     send_digest_email(new_jobs, company_results)
 
     for job in new_jobs:
         write_seen_job(table, job)
 
-    result = {"scraped": len(all_jobs), "relevant": len(relevant_jobs), "new_jobs": len(new_jobs)}
+    result = {
+        "scraped": sum(r["scraped"] for r in company_results),
+        "relevant": len(all_relevant_jobs),
+        "new_jobs": len(new_jobs),
+    }
     logger.info("SDE1 job scraper run complete: %s", result)
-    return {"statusCode": 200, "body": json.dumps(result)}
+    return result

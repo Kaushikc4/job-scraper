@@ -11,11 +11,20 @@
 # and lay the AWS Lambda Runtime Interface Client on top of it. This is
 # the standard community pattern for running Playwright on Lambda.
 #
+# This single image serves THREE Lambda functions (config loader,
+# per-company worker, aggregator — see lambda_function.py's module
+# docstring and README.md for the full architecture). They're
+# differentiated purely by each function's --image-config Command
+# override at create-function time, not by separate Dockerfiles/images
+# — the CMD below is only the default used if a function is invoked
+# without that override.
+#
 # Build:
 #   docker build -t sde1-job-scraper .
 #
-# Push to ECR and deploy — see README.md "Packaging & deploying" section
-# for the full aws ecr / lambda create-function commands.
+# Push to ECR and deploy — see README.md "Building and Deploying"
+# section for the full aws ecr / lambda create-function commands,
+# including the --image-config Command override per function.
 
 FROM mcr.microsoft.com/playwright/python:v1.62.0-noble
 
@@ -37,4 +46,8 @@ COPY lambda_function.py .
 # `playwright install` step is needed here — only the pip package itself.
 
 ENTRYPOINT ["python", "-m", "awslambdaric"]
-CMD ["lambda_function.lambda_handler"]
+# Default handler if a function is created without overriding Command —
+# in practice every function created from this image sets its own
+# --image-config Command (config_loader_handler / worker_handler /
+# aggregator_handler), so this value itself is never relied on.
+CMD ["lambda_function.worker_handler"]
