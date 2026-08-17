@@ -1,6 +1,9 @@
 """
 Local dry-run harness for lambda_function.py — no AWS resources required.
 
+Simulates the Step Functions pipeline sequentially in-process:
+    config_loader_handler -> worker_handler (once per company, in a
+    plain loop instead of a parallel Map state) -> aggregator_handler
 Stubs DynamoDB with an in-memory dict and SES with a print statement, so
 you can verify config parsing, scraping, and filtering against your real
 published Google Sheet before creating any AWS infrastructure.
@@ -48,7 +51,7 @@ def fake_send_digest_email(new_jobs, company_results):
 
 lf.send_digest_email = fake_send_digest_email
 
-# --- Run it --------------------------------------------------------------
+# --- Run it: simulate LoadConfig -> Map(worker) -> SendDigest ------------
 
 if __name__ == "__main__":
     csv_url = os.environ.get("CONFIG_CSV_URL", lf.CONFIG_CSV_URL)
@@ -61,6 +64,29 @@ if __name__ == "__main__":
         )
 
     lf.CONFIG_CSV_URL = csv_url
-    result = lf.lambda_handler({}, None)
-    print("\nFinal result:", result)
+
+    # LoadConfig
+    config = lf.config_loader_handler({}, None)
+    print(f"Loaded {len(config['companies'])} companies, "
+          f"{len(config['include_keywords'])} include keywords, "
+          f"{len(config['exclude_keywords'])} exclude keywords")
+
+    # ScrapeAllCompanies (Map) — sequential here; real deploy runs these
+    # in parallel across separate Lambda invocations
+    worker_results = []
+    for company in config["companies"]:
+        event = {
+            "name": company["name"],
+            "url": company["url"],
+            "include_keywords": config["include_keywords"],
+            "exclude_keywords": config["exclude_keywords"],
+        }
+        result = lf.worker_handler(event, None)
+        print(f"  {result['company']}: {result['scraped']} scraped, "
+              f"{len(result['jobs'])} relevant (status={result['status']})")
+        worker_results.append(result)
+
+    # SendDigest
+    final_result = lf.aggregator_handler(worker_results, None)
+    print("\nFinal result:", final_result)
     print("Fake 'seen jobs' table now contains:", len(_fake_seen_table), "entries")
