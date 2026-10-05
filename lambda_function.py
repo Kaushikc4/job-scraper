@@ -241,7 +241,7 @@ def detect_ats(url):
         return "greenhouse"
     if "lever.co" in host:
         return "lever"
-    if "myworkdayjobs.com" in host:
+    if "myworkdayjobs.com" in host or "myworkdaysite.com" in host:
         return "workday"
     if "smartrecruiters.com" in host:
         return "smartrecruiters"
@@ -322,43 +322,98 @@ def scrape_lever(company_name, url):
     return jobs
 
 
-def scrape_workday(company_name, url):
+def _workday_tenant_and_site(parsed_url):
     """
-    Workday career sites are JS-rendered, but expose a JSON search API at
-    <tenant>.myworkdayjobs.com/wday/cxs/<tenant>/<site>/jobs (POST).
-    We derive tenant/site from the career page URL; this is best-effort
-    since Workday URL structure varies by tenant configuration.
+    Workday career sites come in two different public URL shapes that
+    both proxy to the same underlying /wday/cxs/{tenant}/{site}/jobs
+    API (confirmed by testing — identical results either way):
+
+      *.myworkdayjobs.com/{site}          -> tenant is the subdomain
+      *.myworkdaysite.com/.../recruiting/{tenant}/{site}/...
+                                           -> tenant/site are the two
+                                              path segments right after
+                                              "recruiting" (there can be
+                                              a locale prefix before it,
+                                              e.g. /en-US/recruiting/...,
+                                              so search for the segment
+                                              rather than assume a fixed
+                                              position)
     """
-    parsed = urlparse(url)
-    host_parts = parsed.netloc.split(".")
+    path_parts = [p for p in parsed_url.path.split("/") if p]
+
+    if "myworkdaysite.com" in parsed_url.netloc.lower():
+        if "recruiting" in path_parts:
+            idx = path_parts.index("recruiting")
+            if idx + 2 < len(path_parts):
+                return path_parts[idx + 1], path_parts[idx + 2]
+        return None, None
+
+    host_parts = parsed_url.netloc.split(".")
     tenant = host_parts[0] if host_parts else None
     # Skip an optional locale segment (e.g. /en-US/<site>)
     if path_parts and re.fullmatch(r"[a-z]{2}-[A-Z]{2}", path_parts[0]):
         path_parts = path_parts[1:]
     site = path_parts[0] if path_parts else "External"
+    return tenant, site
 
-    if not tenant:
-        raise ValueError(f"Could not determine Workday tenant from {url}")
+
+def scrape_workday(company_name, url):
+    """
+    Workday career sites are JS-rendered, but expose a JSON search API
+    at /wday/cxs/<tenant>/<site>/jobs (POST) — see
+    _workday_tenant_and_site() for how tenant/site are derived from
+    either of Workday's two public URL shapes. Paginates via
+    limit/offset up to MAX_JOBS_PER_COMPANY (per the API's own `total`
+    field — e.g. Wells Fargo reports 1500+ openings globally).
+    """
+    parsed = urlparse(url)
+    tenant, site = _workday_tenant_and_site(parsed)
+
+    if not tenant or not site:
+        raise ValueError(f"Could not determine Workday tenant/site from {url}")
+
+    # Job detail URLs need the full career-page path as their prefix on
+    # myworkdaysite.com (e.g. /recruiting/wf/WellsFargoJobs/job/... —
+    # just /{site}/job/... 404s), but only /{site}/job/... on
+    # myworkdayjobs.com — confirmed by testing both against real job
+    # links, not assumed.
+    if "myworkdaysite.com" in parsed.netloc.lower():
+        job_url_prefix = parsed.path.rstrip("/")
+    else:
+        job_url_prefix = f"/{site}"
 
     api_url = f"https://{parsed.netloc}/wday/cxs/{tenant}/{site}/jobs"
-    payload = {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": ""}
-    resp = requests.post(
-        api_url, json=payload, timeout=HTTP_TIMEOUT,
-        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    page_size = 20
 
     jobs = []
-    for item in data.get("jobPostings", []):
-        title = item.get("title")
-        path = item.get("externalPath", "")
-        job_url = f"https://{parsed.netloc}/{site}{path}" if path else None
-        posted = item.get("postedOn")
-        ats_id = item.get("bulletFields", [None])[0] if item.get("bulletFields") else None
-        location = item.get("locationsText")
-        jobs.append(normalize_job(company_name, title, job_url, posted, ats_id, location))
-    return jobs
+    offset = 0
+    total = None
+    while total is None or (len(jobs) < min(total, MAX_JOBS_PER_COMPANY) and offset < total):
+        payload = {"appliedFacets": {}, "limit": page_size, "offset": offset, "searchText": ""}
+        resp = requests.post(
+            api_url, json=payload, timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        postings = data.get("jobPostings", [])
+        if not postings:
+            break
+        total = data.get("total", len(postings))
+
+        for item in postings:
+            title = item.get("title")
+            path = item.get("externalPath", "")
+            job_url = f"https://{parsed.netloc}{job_url_prefix}{path}" if path else None
+            posted = item.get("postedOn")
+            ats_id = item.get("bulletFields", [None])[0] if item.get("bulletFields") else None
+            location = item.get("locationsText")
+            jobs.append(normalize_job(company_name, title, job_url, posted, ats_id, location))
+
+        offset += page_size
+
+    return jobs[:MAX_JOBS_PER_COMPANY]
 
 
 def scrape_smartrecruiters(company_name, url):
@@ -758,16 +813,29 @@ _POSTED_TEXT_RE = re.compile(r"(posted\s|days?\s+ago|hours?\s+ago|weeks?\s+ago|\
 
 def _anchor_title(anchor):
     """
-    Prefer an aria-label (common accessibility pattern on SPA job cards:
-    "View job: Title") over raw visible text — visible text on these
-    cards is often one block concatenating title+location+posted-date
-    with no separators, which is unreadable in a digest email.
+    Job cards on SPA career sites often jam title+location+posted-date
+    (and, on some ATS platforms, job-id/job-family) into one text block
+    with no separators — raw anchor text alone is usually unreadable in
+    a digest email. Two cleaner sources, tried in order, before falling
+    back to raw text:
+      1. aria-label (common accessibility pattern: "View job: Title")
+      2. a heading element (h1-h6) nested in the anchor — several ATS
+         platforms wrap just the title in one (e.g. Oracle Taleo's
+         `<a><h2>Title</h2><span>job id: ...</span>...</a>`), separate
+         from the surrounding metadata text.
     """
     aria_label = (anchor.get("aria-label") or "").strip()
     if aria_label:
         cleaned = _ARIA_LABEL_PREFIX_RE.sub("", aria_label).strip()
         if len(cleaned) >= 4:
             return cleaned
+
+    heading = anchor.find(re.compile(r"^h[1-6]$"))
+    if heading:
+        heading_text = heading.get_text(strip=True)
+        if len(heading_text) >= 4:
+            return heading_text
+
     return anchor.get_text(strip=True)
 
 
@@ -832,6 +900,8 @@ def _extract_generic_jobs(company_name, base_url, soup):
         title = _anchor_title(anchor)
         href = anchor.get("href")
         if not title or not href or len(title) < 4:
+            continue
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
             continue
 
         job_url = href if href.startswith("http") else _urljoin(base_url, href)
