@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import signal
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -240,7 +241,7 @@ def detect_ats(url):
         return "greenhouse"
     if "lever.co" in host:
         return "lever"
-    if "myworkdayjobs.com" in host:
+    if "myworkdayjobs.com" in host or "myworkdaysite.com" in host:
         return "workday"
     if "smartrecruiters.com" in host:
         return "smartrecruiters"
@@ -266,6 +267,11 @@ def _extract_board_token(url, marker_segments):
     https://jobs.lever.co/stripe -> "stripe"
     """
     parsed = urlparse(url)
+    # API URLs carry the token after a fixed segment (e.g.
+    # boards-api.greenhouse.io/v1/boards/<token>/jobs, api.lever.co/v0/postings/<token>)
+    api_match = re.search(r"/(?:boards|postings|companies)/([^/?#]+)", parsed.path)
+    if api_match:
+        return api_match.group(1)
     parts = [p for p in parsed.path.split("/") if p]
     if parts:
         return parts[0]
@@ -322,29 +328,65 @@ def scrape_lever(company_name, url):
     return jobs
 
 
-def scrape_workday(company_name, url):
+def _workday_tenant_and_site(parsed_url):
     """
-    Workday career sites are JS-rendered, but expose a JSON search API at
-    <tenant>.myworkdayjobs.com/wday/cxs/<tenant>/<site>/jobs (POST).
-    We derive tenant/site from the career page URL; this is best-effort
-    since Workday URL structure varies by tenant configuration.
+    Workday career sites come in two different public URL shapes that
+    both proxy to the same underlying /wday/cxs/{tenant}/{site}/jobs
+    API (confirmed by testing — identical results either way):
 
-    Filters on the configured URL (e.g. ?locations=<id>&jobFamilyGroup=<id>,
-    as the site's own filter UI writes them) are forwarded as the API's
-    appliedFacets, and `q` as searchText. Paginates via offset (API max
-    page size is 20); `total` is only reported on the first page.
+      *.myworkdayjobs.com/{site}          -> tenant is the subdomain
+      *.myworkdaysite.com/.../recruiting/{tenant}/{site}/...
+                                           -> tenant/site are the two
+                                              path segments right after
+                                              "recruiting" (there can be
+                                              a locale prefix before it,
+                                              e.g. /en-US/recruiting/...,
+                                              so search for the segment
+                                              rather than assume a fixed
+                                              position)
     """
-    parsed = urlparse(url)
-    host_parts = parsed.netloc.split(".")
+    path_parts = [p for p in parsed_url.path.split("/") if p]
+
+    if "myworkdaysite.com" in parsed_url.netloc.lower():
+        if "recruiting" in path_parts:
+            idx = path_parts.index("recruiting")
+            if idx + 2 < len(path_parts):
+                return path_parts[idx + 1], path_parts[idx + 2]
+        return None, None
+
+    host_parts = parsed_url.netloc.split(".")
     tenant = host_parts[0] if host_parts else None
-    path_parts = [p for p in parsed.path.split("/") if p]
     # Skip an optional locale segment (e.g. /en-US/<site>)
     if path_parts and re.fullmatch(r"[a-z]{2}-[A-Z]{2}", path_parts[0]):
         path_parts = path_parts[1:]
     site = path_parts[0] if path_parts else "External"
+    return tenant, site
 
-    if not tenant:
-        raise ValueError(f"Could not determine Workday tenant from {url}")
+
+def scrape_workday(company_name, url):
+    """
+    Workday career sites are JS-rendered, but expose a JSON search API
+    at /wday/cxs/<tenant>/<site>/jobs (POST) — see
+    _workday_tenant_and_site() for how tenant/site are derived from
+    either of Workday's two public URL shapes. Paginates via
+    limit/offset up to MAX_JOBS_PER_COMPANY (per the API's own `total`
+    field — e.g. Wells Fargo reports 1500+ openings globally).
+    """
+    parsed = urlparse(url)
+    tenant, site = _workday_tenant_and_site(parsed)
+
+    if not tenant or not site:
+        raise ValueError(f"Could not determine Workday tenant/site from {url}")
+
+    # Job detail URLs need the full career-page path as their prefix on
+    # myworkdaysite.com (e.g. /recruiting/wf/WellsFargoJobs/job/... —
+    # just /{site}/job/... 404s), but only /{site}/job/... on
+    # myworkdayjobs.com — confirmed by testing both against real job
+    # links, not assumed.
+    if "myworkdaysite.com" in parsed.netloc.lower():
+        job_url_prefix = parsed.path.rstrip("/")
+    else:
+        job_url_prefix = f"/{site}"
 
     query = parse_qs(parsed.query)
     search_text = query.pop("q", [""])[0]
@@ -436,9 +478,7 @@ def scrape_microsoft(company_name, url):
     total = None
     while total is None or (len(jobs) < min(total, MAX_JOBS_PER_COMPANY) and start < total):
         params = {"domain": "microsoft.com", "query": search_query, "location": search_location, "start": start}
-        resp = requests.get(api_url, params=params, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
+        data = _get_json(api_url, params=params).get("data", {})
 
         positions = data.get("positions", [])
         if not positions:
@@ -760,6 +800,29 @@ def _extract_js_object(content, marker):
         return None
 
 
+def _fetch_html_or_none(url):
+    """Detection-only fetch: a failed request means 'not this platform' and
+    must fall through to the next tier, not abort the whole company."""
+    try:
+        resp = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        return resp.text
+    except requests.RequestException as exc:
+        logger.info("Detection fetch failed for %s (%s); trying next tier.", url, exc)
+        return None
+
+
+def _get_json(url, params=None, attempts=3):
+    """GET JSON, backing off on rate limiting (429) and transient 5xx errors."""
+    for i in range(attempts):
+        resp = requests.get(url, params=params, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+        if resp.status_code in (429, 500, 502, 503, 504) and i < attempts - 1:
+            time.sleep(2 ** (i + 1))
+            continue
+        resp.raise_for_status()
+        return resp.json()
+
+
 def _phenom_jobs_from_raw(company_name, jobs_raw):
     jobs = []
     for item in jobs_raw:
@@ -788,9 +851,9 @@ def try_scrape_phenom(company_name, url):
     given page doesn't yield more embedded data, pagination just stops
     rather than erroring.
     """
-    resp = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
-    resp.raise_for_status()
-    html = resp.text
+    html = _fetch_html_or_none(url)
+    if html is None:
+        return None
 
     if "phApp.ddo" not in html:
         return None
@@ -833,22 +896,154 @@ def try_scrape_phenom(company_name, url):
     return jobs[:MAX_JOBS_PER_COMPANY]
 
 
+_EIGHTFOLD_MARKER_RE = re.compile(r"pcsx", re.I)
+_DOMAIN_RE = re.compile(r"\b([a-z0-9-]+\.(?:com|io|net|org|co|in|ai))\b", re.I)
+
+
+def _brand_domain(host, html):
+    """
+    Eightfold's API takes the company's registrable domain (e.g. netflix.com)
+    even when the careers host is a subdomain (explore.jobs.netflix.net).
+    Pick the most frequent domain in the page whose name matches a host label.
+    """
+    labels = host.split(".")
+    counts = {}
+    for m in _DOMAIN_RE.finditer(html):
+        dom = m.group(1).lower()
+        counts[dom] = counts.get(dom, 0) + 1
+    for dom, _ in sorted(counts.items(), key=lambda kv: -kv[1]):
+        sld = dom.split(".")[0]
+        if len(sld) > 2 and sld in labels:
+            return dom
+    return None
+
+
+def _eightfold_page(base, domain, start, location):
+    """One page of an Eightfold job search. Tries the PCS endpoint first,
+    then the apply/v2 endpoint (both seen in production sites), and returns
+    (endpoint_name, positions) or (None, []) if neither responds with jobs."""
+    attempts = [
+        ("pcsx", f"{base}/api/pcsx/search",
+         {"domain": domain, "query": "", "location": location, "start": start}),
+        ("apply_v2", f"{base}/api/apply/v2/jobs",
+         {"domain": domain, "query": "", "location": location, "start": start, "num": 10}),
+    ]
+    for name, api_url, params in attempts:
+        try:
+            data = _get_json(api_url, params=params)
+        except (requests.RequestException, ValueError):
+            continue
+        positions = (data.get("data") or {}).get("positions") or data.get("positions") or []
+        if positions:
+            return name, positions
+    return None, []
+
+
+def try_scrape_eightfold(company_name, url):
+    """
+    Eightfold-powered career sites (e.g. Qualcomm, Netflix, Microsoft's
+    own board uses the same family) render from a JSON search API whose
+    marker — "pcsx" CSS/API naming — is present in the raw page HTML. Plain
+    HTTP, no browser. Returns None if the page isn't Eightfold-powered.
+    """
+    html = _fetch_html_or_none(url)
+    if html is None:
+        return None
+    if not _EIGHTFOLD_MARKER_RE.search(html):
+        return None
+
+    host = urlparse(url).netloc.lower()
+    domain = _brand_domain(host, html)
+    if not domain:
+        return None
+    base = f"https://{host}"
+
+    jobs = []
+    endpoint = None
+    start = 0
+    while len(jobs) < MAX_JOBS_PER_COMPANY:
+        name, positions = _eightfold_page(base, domain, start, "India")
+        if not positions:
+            break
+        endpoint = endpoint or name
+        for item in positions:
+            title = item.get("name") or item.get("posting_name")
+            path = item.get("positionUrl") or item.get("canonicalPositionUrl") or ""
+            job_url = path if path.startswith("http") else f"{base}{path}" if path else None
+            posted_ts = item.get("postedTs")
+            posted = (datetime.fromtimestamp(posted_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                      if isinstance(posted_ts, (int, float)) else None)
+            location = ", ".join(item.get("locations") or []) or None
+            ats_id = item.get("id") or item.get("atsJobId")
+            jobs.append(normalize_job(company_name, title, job_url, posted, ats_id, location))
+        start += len(positions)
+
+    if endpoint is None:
+        return None
+    return jobs[:MAX_JOBS_PER_COMPANY]
+
+
+def _slug_candidates(company_name):
+    slug = re.sub(r"[^a-z0-9]", "", company_name.lower())
+    return [slug] if slug else []
+
+
+def try_probe_public_board(company_name):
+    """
+    Some companies host a public Lever or Greenhouse board under their
+    exact company-name slug (e.g. Meesho -> jobs.lever.co/meesho), even
+    when their own career page is a custom site. Probe those public APIs
+    directly — no browser — and accept only an exact slug with real
+    postings to avoid matching an unrelated company with a similar name.
+    Returns (jobs, tier) or None.
+    """
+    for slug in _slug_candidates(company_name):
+        try:
+            resp = requests.get(f"https://api.lever.co/v0/postings/{slug}?mode=json",
+                                timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+            if resp.status_code == 200 and resp.json():
+                return scrape_lever(company_name, f"https://jobs.lever.co/{slug}"), "board_probe_lever"
+        except (requests.RequestException, ValueError):
+            pass
+        try:
+            resp = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+                                timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+            if resp.status_code == 200 and resp.json().get("jobs"):
+                return scrape_greenhouse(company_name, f"https://boards.greenhouse.io/{slug}"), "board_probe_greenhouse"
+        except (requests.RequestException, ValueError):
+            pass
+    return None
+
+
 _ARIA_LABEL_PREFIX_RE = re.compile(r"^(view job|apply for|job)\s*[:\-]\s*", re.I)
 _POSTED_TEXT_RE = re.compile(r"(posted\s|days?\s+ago|hours?\s+ago|weeks?\s+ago|\d{4}-\d{2}-\d{2})", re.I)
 
 
 def _anchor_title(anchor):
     """
-    Prefer an aria-label (common accessibility pattern on SPA job cards:
-    "View job: Title") over raw visible text — visible text on these
-    cards is often one block concatenating title+location+posted-date
-    with no separators, which is unreadable in a digest email.
+    Job cards on SPA career sites often jam title+location+posted-date
+    (and, on some ATS platforms, job-id/job-family) into one text block
+    with no separators — raw anchor text alone is usually unreadable in
+    a digest email. Two cleaner sources, tried in order, before falling
+    back to raw text:
+      1. aria-label (common accessibility pattern: "View job: Title")
+      2. a heading element (h1-h6) nested in the anchor — several ATS
+         platforms wrap just the title in one (e.g. Oracle Taleo's
+         `<a><h2>Title</h2><span>job id: ...</span>...</a>`), separate
+         from the surrounding metadata text.
     """
     aria_label = (anchor.get("aria-label") or "").strip()
     if aria_label:
         cleaned = _ARIA_LABEL_PREFIX_RE.sub("", aria_label).strip()
         if len(cleaned) >= 4:
             return cleaned
+
+    heading = anchor.find(re.compile(r"^h[1-6]$"))
+    if heading:
+        heading_text = heading.get_text(strip=True)
+        if len(heading_text) >= 4:
+            return heading_text
+
     return anchor.get_text(strip=True)
 
 
@@ -867,6 +1062,11 @@ def _find_posted_date(anchor):
 
 
 _LOCATION_TEXT_RE = re.compile(r"\bremote\b|\bindia\b|[A-Za-z]+,\s*[A-Za-z]+", re.I)
+# A link only counts as a job in the generic tier if its URL looks like a
+# job detail page (path segment, id, or requisition), not a nav/menu page.
+_JOB_DETAIL_URL_RE = re.compile(
+    r"/jobs?/|/position|/requisition|/opening|/posting|job[_-]?id=|\d{5,}", re.I
+)
 
 
 def _find_location(anchor):
@@ -909,9 +1109,11 @@ def _extract_generic_jobs(company_name, base_url, soup):
         href = anchor.get("href")
         if not title or not href or len(title) < 4:
             continue
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
 
         job_url = href if href.startswith("http") else _urljoin(base_url, href)
-        if job_url in seen_urls:
+        if job_url in seen_urls or not _JOB_DETAIL_URL_RE.search(job_url):
             continue
         seen_urls.add(job_url)
 
