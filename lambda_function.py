@@ -251,6 +251,12 @@ def detect_ats(url):
         return "google"
     if host.endswith("careers.microsoft.com"):
         return "microsoft"
+    if host.endswith(".oraclecloud.com") and "/CandidateExperience/" in urlparse(url).path:
+        return "oracle"
+    if host == "globalcareers.lge.com":
+        return "lge"
+    if host == "jobs.apple.com":
+        return "apple"
     return None
 
 
@@ -382,14 +388,18 @@ def scrape_workday(company_name, url):
     else:
         job_url_prefix = f"/{site}"
 
+    query = parse_qs(parsed.query)
+    search_text = query.pop("q", [""])[0]
+    facets = {k: v for k, v in query.items() if v}
+
     api_url = f"https://{parsed.netloc}/wday/cxs/{tenant}/{site}/jobs"
     page_size = 20
 
     jobs = []
     offset = 0
     total = None
-    while total is None or (len(jobs) < min(total, MAX_JOBS_PER_COMPANY) and offset < total):
-        payload = {"appliedFacets": {}, "limit": page_size, "offset": offset, "searchText": ""}
+    while len(jobs) < MAX_JOBS_PER_COMPANY:
+        payload = {"appliedFacets": facets, "limit": page_size, "offset": offset, "searchText": search_text}
         resp = requests.post(
             api_url, json=payload, timeout=HTTP_TIMEOUT,
             headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
@@ -397,21 +407,29 @@ def scrape_workday(company_name, url):
         resp.raise_for_status()
         data = resp.json()
 
-        postings = data.get("jobPostings", [])
-        if not postings:
+        page_jobs = data.get("jobPostings", [])
+        if not page_jobs:
             break
-        total = data.get("total", len(postings))
+        if total is None:
+            total = data.get("total", 0)
 
-        for item in postings:
+        for item in page_jobs:
             title = item.get("title")
             path = item.get("externalPath", "")
-            job_url = f"https://{parsed.netloc}{job_url_prefix}{path}" if path else None
+            job_url = f"https://{parsed.netloc}/{site}{path}" if path else None
             posted = item.get("postedOn")
             ats_id = item.get("bulletFields", [None])[0] if item.get("bulletFields") else None
             location = item.get("locationsText")
+            # Multi-location postings only say "2 Locations"; the primary
+            # one is still in the path (/job/India-Bangalore/...).
+            if location and re.fullmatch(r"\d+ Locations", location):
+                path_loc = re.match(r"/job/([^/]+)/", path)
+                location = path_loc.group(1).replace("-", ", ", 1) if path_loc else None
             jobs.append(normalize_job(company_name, title, job_url, posted, ats_id, location))
 
-        offset += page_size
+        offset += len(page_jobs)
+        if len(page_jobs) < page_size or offset >= total:
+            break
 
     return jobs[:MAX_JOBS_PER_COMPANY]
 
@@ -538,6 +556,196 @@ def scrape_amazon(company_name, url):
         if len(page_jobs) < page_size or offset + page_size >= data.get("hits", 0):
             break
         offset += page_size
+
+    return jobs[:MAX_JOBS_PER_COMPANY]
+
+
+def scrape_oracle(company_name, url):
+    """
+    Oracle Recruiting Cloud ("Candidate Experience") sites, e.g.
+    jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/jobs,
+    are a JS-only SPA, but the page itself is fed by a public JSON API on
+    the same host: /hcmRestApi/resources/latest/recruitingCEJobRequisitions.
+    Site number comes from the /sites/<site>/ path segment. Custom-domain
+    sites (e.g. careers.oracle.com) are handled by try_scrape_oracle_custom_domain.
+    """
+    parsed = urlparse(url)
+    path_match = re.search(r"/CandidateExperience/([^/]+)/sites/([^/?#]+)", parsed.path)
+    if not path_match:
+        raise ValueError(f"Could not determine Oracle site number from {url}")
+    lang, site = path_match.groups()
+    job_url_base = f"https://{parsed.netloc}/hcmUI/CandidateExperience/{lang}/sites/{site}/job/"
+    return _oracle_jobs(company_name, parsed.netloc, site, job_url_base, parse_qs(parsed.query))
+
+
+_ORACLE_API_HOST_RE = re.compile(r"https://([a-z0-9.-]+\.oraclecloud\.com)(?::443)?/hcm(?:UI|RestApi)/C", re.I)
+_ORACLE_SITE_NUMBER_RE = re.compile(r"siteNumber=(CX(?:_\w+)?)\b")
+
+
+def try_scrape_oracle_custom_domain(company_name, url):
+    """
+    Oracle Recruiting Cloud sites served from the company's own domain
+    (e.g. careers.oracle.com/en/sites/jobsearch/jobs) have no oraclecloud.com
+    in the URL, but the raw HTML still references the real backend host
+    and site number (favicon/static links like
+    eeho.fa.us2.oraclecloud.com/...?siteNumber=CX_45001). Returns None if
+    this page isn't Oracle-powered, so the caller can fall through.
+    """
+    html = _fetch_html_or_none(url)
+    if html is None:
+        return None
+    host_match = _ORACLE_API_HOST_RE.search(html)
+    site_match = _ORACLE_SITE_NUMBER_RE.search(html)
+    if not host_match or not site_match:
+        return None
+
+    parsed = urlparse(url)
+    # Job pages live next to the search page: .../sites/<alias>/job/<id>
+    prefix_match = re.match(r"(.*?/sites/[^/]+/)", parsed.path)
+    prefix = prefix_match.group(1) if prefix_match else "/"
+    job_url_base = f"https://{parsed.netloc}{prefix}job/"
+    return _oracle_jobs(company_name, host_match.group(1), site_match.group(1),
+                        job_url_base, parse_qs(parsed.query))
+
+
+def _oracle_jobs(company_name, api_host, site, job_url_base, query):
+    """
+    Shared Oracle Recruiting Cloud API pagination. `keyword` and the
+    location filter (`locationId`, or `selectedLocationsFacet` as custom-
+    domain sites write it) are forwarded from the configured URL's query
+    params. Paginates via offset up to MAX_JOBS_PER_COMPANY (API's
+    TotalJobsCount).
+    """
+    finder_parts = [f"siteNumber={site}"]
+    keyword = query.get("keyword", [""])[0]
+    if keyword:
+        finder_parts.append(f'keyword="{keyword}"')
+    location_id = (query.get("locationId") or query.get("selectedLocationsFacet") or [""])[0]
+    if location_id:
+        finder_parts.append(f"locationId={location_id}")
+
+    api_url = f"https://{api_host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions"
+    page_size = 25
+
+    jobs = []
+    offset = 0
+    while len(jobs) < MAX_JOBS_PER_COMPANY:
+        finder = "findReqs;" + ",".join(finder_parts + [
+            f"limit={page_size}", f"offset={offset}", "sortBy=POSTING_DATES_DESC",
+        ])
+        params = {"onlyData": "true", "expand": "requisitionList", "finder": finder}
+        items = _get_json(api_url, params=params).get("items") or [{}]
+        result = items[0]
+
+        page_jobs = result.get("requisitionList") or []
+        if not page_jobs:
+            break
+
+        for item in page_jobs:
+            ats_id = item.get("Id")
+            title = item.get("Title")
+            job_url = f"{job_url_base}{ats_id}"
+            posted = item.get("PostedDate")
+            location = item.get("PrimaryLocation")
+            jobs.append(normalize_job(company_name, title, job_url, posted, ats_id, location))
+
+        offset += len(page_jobs)
+        if offset >= result.get("TotalJobsCount", 0):
+            break
+
+    return jobs[:MAX_JOBS_PER_COMPANY]
+
+
+def scrape_lge(company_name, url):
+    """
+    globalcareers.lge.com is a JS-rendered SPA backed by a public JSON API
+    on the same host: /api/job/v1/jobs/?regions=<code>&page=<n>&size=<n>.
+    The site's region filter doesn't show up in the page URL, so we default
+    to regions=IN (India) — the full global list is ~270 jobs, enough that
+    MAX_JOBS_PER_COMPANY would otherwise cut off most India roles. A
+    `regions` param on the configured URL overrides this.
+    """
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    regions = query.get("regions", ["IN"])[0]
+
+    api_url = f"https://{parsed.netloc}/api/job/v1/jobs/"
+    page_size = 50
+
+    jobs = []
+    page = 1
+    while len(jobs) < MAX_JOBS_PER_COMPANY:
+        params = {"regions": regions, "page": page, "size": page_size}
+        data = _get_json(api_url, params=params).get("data") or {}
+
+        page_jobs = data.get("list") or []
+        if not page_jobs:
+            break
+
+        for item in page_jobs:
+            if item.get("status") != "OPEN":
+                continue
+            ats_id = item.get("id")
+            title = item.get("title")
+            job_url = f"https://{parsed.netloc}/jobs/{ats_id}"
+            created = item.get("postCreateDtm") or item.get("insDtm")
+            posted = f"{created[0]:04d}-{created[1]:02d}-{created[2]:02d}" if created else None
+            location = ", ".join(filter(None, [item.get("location"), item.get("cntryNm")])) or None
+            jobs.append(normalize_job(company_name, title, job_url, posted, ats_id, location))
+
+        if page * page_size >= data.get("total", 0):
+            break
+        page += 1
+
+    return jobs[:MAX_JOBS_PER_COMPANY]
+
+
+_APPLE_HYDRATION_RE = re.compile(r'window\.__staticRouterHydrationData\s*=\s*JSON\.parse\((".*?")\);', re.S)
+
+
+def scrape_apple(company_name, url):
+    """
+    jobs.apple.com server-renders each search results page with the job
+    list embedded as `window.__staticRouterHydrationData = JSON.parse("...")`
+    (loaderData.search.searchResults), so a plain HTTP GET is enough — no
+    browser. The configured URL's own filters (search, location, team...)
+    are reused as-is; pages are fetched by adding `page=<n>` (20 per page).
+    """
+    parsed = urlparse(url)
+    query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+    locale = next((p for p in parsed.path.split("/") if p), "en-us")
+    base_url = f"https://{parsed.netloc}{parsed.path}"
+
+    jobs = []
+    page = 1
+    while len(jobs) < MAX_JOBS_PER_COMPANY:
+        resp = requests.get(base_url, params={**query, "page": page},
+                            timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        match = _APPLE_HYDRATION_RE.search(resp.text)
+        if not match:
+            break
+        search = json.loads(json.loads(match.group(1))).get("loaderData", {}).get("search") or {}
+
+        page_jobs = search.get("searchResults") or []
+        if not page_jobs:
+            break
+
+        for item in page_jobs:
+            ats_id = item.get("id")
+            title = item.get("postingTitle")
+            slug = item.get("transformedPostingTitle") or ""
+            job_url = f"https://{parsed.netloc}/{locale}/details/{ats_id}/{slug}"
+            posted = (item.get("postDateInGMT") or "")[:10] or item.get("postingDate")
+            location = "; ".join(
+                ", ".join(filter(None, [loc.get("name"), loc.get("countryName")]))
+                for loc in item.get("locations") or []
+            ) or None
+            jobs.append(normalize_job(company_name, title, job_url, posted, ats_id, location))
+
+        if len(jobs) >= search.get("totalRecords", 0):
+            break
+        page += 1
 
     return jobs[:MAX_JOBS_PER_COMPANY]
 
@@ -1113,6 +1321,9 @@ ATS_SCRAPERS = {
     "smartrecruiters": scrape_smartrecruiters,
     "amazon": scrape_amazon,
     "microsoft": scrape_microsoft,
+    "oracle": scrape_oracle,
+    "lge": scrape_lge,
+    "apple": scrape_apple,
 }
 
 # Known platforms that need a rendered DOM (not just an HTTP GET) but have
@@ -1161,6 +1372,11 @@ def scrape_company(company, renderer):
         if phenom_jobs is not None:
             logger.info("Scraping '%s' via detected Phenom People embedded data (%s)", name, url)
             return phenom_jobs, "phenom"
+
+        oracle_jobs = try_scrape_oracle_custom_domain(name, url)
+        if oracle_jobs is not None:
+            logger.info("Scraping '%s' via detected Oracle Recruiting Cloud API (%s)", name, url)
+            return oracle_jobs, "oracle"
 
         eightfold_jobs = try_scrape_eightfold(name, url)
         if eightfold_jobs is not None:
@@ -1219,10 +1435,16 @@ def is_india_or_remote(location):
 
 
 def filter_jobs(jobs, include_keywords, exclude_keywords):
+    """
+    Keyword filter, then location: a job with a known location must be
+    India or remote. A job with no location text is kept, since some
+    career pages (e.g. PayU) never show one, and the digest marks it
+    as "Location unknown" so it can be checked before applying.
+    """
     return [
         j for j in jobs
         if is_relevant(j["title"], include_keywords, exclude_keywords)
-        and is_india_or_remote(j.get("location"))
+        and (not j.get("location") or is_india_or_remote(j["location"]))
     ]
 
 
@@ -1373,7 +1595,7 @@ def build_email_body(new_jobs, company_results):
 
     for job in sorted(new_jobs, key=lambda j: j["company"].lower()):
         posted = job.get("posted_date") or "N/A"
-        location = job.get("location") or "N/A"
+        location = job.get("location") or "Location unknown"
         lines_text.append(
             f"- [{job['company']}] {job['title']} ({location}, posted: {posted})\n  {job['url']}\n"
         )
